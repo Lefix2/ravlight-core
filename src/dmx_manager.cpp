@@ -5,6 +5,7 @@
 #include <dmx_manager.h>
 #include "esp_log.h"
 #include "esp_wifi.h"
+#include "AsyncUDP.h"
 #ifdef RAVLIGHT_MODULE_RECORDER
 #include "dmx_recorder.h"
 #endif
@@ -13,10 +14,18 @@
 #include <fcntl.h>
 #include <string.h>
 
-#ifdef RAVLIGHT_MODULE_DMX_PHYSICAL
+#if defined(RAVLIGHT_MODULE_DMX_PHYSICAL) || defined(RAVLIGHT_MODULE_DMX_PHYSICAL_2)
 #include <esp_dmx.h>
+#endif
+
+#ifdef RAVLIGHT_MODULE_DMX_PHYSICAL
 dmx_port_t dmxPort = DMX_NUM_1;
 bool dmxIsConnected = false;
+#endif
+
+#ifdef RAVLIGHT_MODULE_DMX_PHYSICAL_2
+dmx_port_t dmxPort2 = DMX_NUM_0;
+bool dmxIsConnected2 = false;
 #endif
 
 #define TAG "DMX"
@@ -25,13 +34,46 @@ SemaphoreHandle_t dmxBufferMutex = NULL;
 uint8_t dmxBuffer[DMX_BUFFER_SIZE];
 
 // ── Universe pool ─────────────────────────────────────────────────────────────
+//
+// Double-buffered to support Art-Net 4 ArtSync. Each universe carries two
+// buffers; writeToPool() always writes the "pending" one (1 - active_idx).
+// ArtSync flips active_idx atomically for every universe that was touched —
+// the render task then sees a coherent snapshot across all universes instead
+// of mid-frame torn data.
+//
+// When no ArtSync packet has been seen recently (ARTSYNC_TIMEOUT_MS), the
+// receiver falls back to "immediate apply" — writeToPool swaps the buffer
+// inline, matching the original behaviour for controllers that don't speak
+// Art-Net 4 (xLights, ETC consoles, etc.).
+//
+// Reads (getUniverseData) are lock-free: a single byte load of active_idx
+// is atomic on ESP32, and the active buffer never gets written by anyone
+// other than the next swap. Render therefore never blocks on the mutex.
 
 struct universe_slot_t {
     uint16_t id;
-    uint8_t  data[513];   // data[0] unused; data[1..512] = DMX channels 1-512
+    uint32_t last_seen_ms;     // millis() of the most recent frame for this universe (0 = never)
+    uint8_t  active_idx;       // 0 or 1 — which of data[] the render currently sees
+    uint8_t  pending_dirty;    // 1 if data[1-active_idx] has new bytes awaiting an ArtSync swap
+    uint8_t  data[2][513];     // double buffer; [0] unused channel slot per buffer
 };
 static universe_slot_t universePool[DMX_MAX_UNIVERSES];
 static uint8_t         universeCount = 0;
+
+// Sync packet tracking — covers both Art-Net 4 ArtSync (opcode 0x5200) and
+// E1.31 Extended Synchronization (VECTOR_E131_EXTENDED_SYNCHRONIZATION). When
+// either has been seen recently we run in "buffered" mode (writeToPool defers
+// the active_idx flip); after SYNC_TIMEOUT_MS of silence we fall back to
+// inline apply so legacy controllers without sync still work.
+static volatile uint32_t s_sync_last_ms      = 0;
+static volatile uint32_t s_artsync_packets   = 0;   // Art-Net 0x5200
+static volatile uint32_t s_sacnsync_packets  = 0;   // sACN ext sync
+static volatile bool     s_swap_pending      = false;
+static const uint32_t    SYNC_TIMEOUT_MS     = 1000;
+
+static inline bool sync_active(uint32_t now_ms) {
+    return s_sync_last_ms != 0 && (now_ms - s_sync_last_ms) < SYNC_TIMEOUT_MS;
+}
 
 void registerDmxUniverse(uint16_t universe) {
     for (int i = 0; i < universeCount; i++)
@@ -47,60 +89,149 @@ void registerDmxUniverse(uint16_t universe) {
 }
 
 const uint8_t* getUniverseData(uint16_t universe) {
+    // Lock-free read: the render task sees the active buffer; ArtSync swaps
+    // active_idx atomically (single-byte write). Writes to the pending buffer
+    // by the network task never touch the active buffer that we return here.
     for (int i = 0; i < universeCount; i++)
-        if (universePool[i].id == universe) return universePool[i].data;
+        if (universePool[i].id == universe)
+            return universePool[i].data[universePool[i].active_idx];
     return nullptr;
 }
 
 // ArtNet data is 0-indexed (ch1 at src[0]); pool is 1-indexed (ch1 at data[1]).
+// Always writes to the "pending" buffer. If we're not currently seeing
+// ArtSync packets (or have never seen one), we also flip active_idx in the
+// same call so legacy controllers behave as before.
 static void writeToPool(uint16_t universe, const uint8_t* src, uint16_t size) {
     uint16_t n = (size > 512) ? 512 : size;
+    uint32_t now = millis();
+    bool immediate = !sync_active(now);
+
     for (int i = 0; i < universeCount; i++) {
         if (universePool[i].id != universe) continue;
-        memcpy(universePool[i].data + 1, src, n);
+        uint8_t pending = 1 - universePool[i].active_idx;
+        memcpy(universePool[i].data[pending] + 1, src, n);
+        universePool[i].last_seen_ms = now;
+        if (immediate) {
+            // No ArtSync mode: swap inline so this frame is visible right away.
+            universePool[i].active_idx   = pending;
+            universePool[i].pending_dirty = 0;
+        } else {
+            universePool[i].pending_dirty = 1;
+        }
         if (universe == dmxConfig.startUniverse)
             memcpy(dmxBuffer + 1, src, n);
         return;
     }
 }
 
+// Atomically swap every dirty universe's active buffer in one pass. Called
+// from onArtnetPacket() on ArtSync receipt under dmxBufferMutex, and also
+// deferred-applied at the start of each render frame (see dmxApplyPendingSwap).
+static void artsyncSwapDirty() {
+    for (int i = 0; i < universeCount; i++) {
+        if (universePool[i].pending_dirty) {
+            universePool[i].active_idx ^= 1;
+            universePool[i].pending_dirty = 0;
+        }
+    }
+}
+
+// Render task calls this at the start of every frame: if an ArtSync arrived
+// while a frame was in flight we deferred the actual swap to avoid mid-frame
+// tearing. Apply it now, under the mutex, before reading any universe data.
+void dmxApplyPendingSwap() {
+    if (!s_swap_pending || !dmxBufferMutex) return;
+    xSemaphoreTake(dmxBufferMutex, portMAX_DELAY);
+    if (s_swap_pending) {
+        artsyncSwapDirty();
+        s_swap_pending = false;
+    }
+    xSemaphoreGive(dmxBufferMutex);
+}
+
+uint32_t artsyncPacketCount()  { return s_artsync_packets;  }
+uint32_t sacnsyncPacketCount() { return s_sacnsync_packets; }
+
+uint32_t getUniverseLastSeen(uint16_t universe) {
+    for (int i = 0; i < universeCount; i++)
+        if (universePool[i].id == universe) return universePool[i].last_seen_ms;
+    return 0;
+}
+
+uint8_t  dmxUniverseCount()           { return universeCount; }
+uint16_t dmxUniverseAt(uint8_t idx)   { return (idx < universeCount) ? universePool[idx].id : 0; }
+
 static void writeToPoolSacn(uint16_t universe, const uint8_t* src, uint16_t size) {
     writeToPool(universe, src, size);
 }
 
-// ── ArtNet (raw lwip UDP socket, INADDR_ANY port 6454) ───────────────────────
-// Single socket receives from all interfaces (ETH, WiFi STA, AP) simultaneously.
+void injectDmxUniverse(uint16_t universe, const uint8_t* src, uint16_t length) {
+    if (!src || !dmxBufferMutex) return;
+    xSemaphoreTake(dmxBufferMutex, portMAX_DELAY);
+    writeToPool(universe, src, length);
+    xSemaphoreGive(dmxBufferMutex);
+    DMXLedRun();
+}
+
+// ── ArtNet (AsyncUDP, port 6454) ─────────────────────────────────────────────
+// AsyncUDP registers a raw lwIP udp_recv callback: each datagram is handled the
+// moment the network stack delivers it, with no fixed-size BSD-socket receive
+// mailbox in the path. That mailbox (~6 datagrams, a compile-time limit in the
+// Arduino framework) was the wall — Resolume bursts all 16 universes at once and
+// the tail was dropped before the firmware could read it. Same approach WLED
+// uses to ingest many universes on this hardware.
 
 #define ARTNET_PORT 6454
-static int artnetSock = -1;
+static AsyncUDP artnetUdp;
+static volatile uint32_t s_artnetPackets = 0;  // received ArtDMX count (diagnostic)
+static void sendArtPollReply(const IPAddress& requester);  // defined below
+
+static void onArtnetPacket(AsyncUDPPacket& packet) {
+    const uint8_t* buf = packet.data();
+    int n = (int)packet.length();
+    if (n < 10 || memcmp(buf, "Art-Net\0", 8) != 0) return;
+    uint16_t opcode = buf[8] | ((uint16_t)buf[9] << 8);   // LE
+    if (opcode == 0x5000) {          // ArtDMX
+        if (n < 18) return;
+        uint16_t universe = buf[14] | ((uint16_t)(buf[15] & 0x7F) << 8);
+        uint16_t length   = ((uint16_t)buf[16] << 8) | buf[17];   // BE
+        if (length > 512 || n < 18 + (int)length) return;
+        s_artnetPackets++;
+        if (dmxBufferMutex) {
+            xSemaphoreTake(dmxBufferMutex, portMAX_DELAY);
+            writeToPool(universe, buf + 18, length);
+            xSemaphoreGive(dmxBufferMutex);
+        }
+        DMXLedRun();
+    } else if (opcode == 0x5200) {  // ArtSync (Art-Net 4)
+        // Mark every dirty universe ready for the next render frame. We defer
+        // the actual active_idx flip to dmxApplyPendingSwap() so a render in
+        // flight doesn't see a half-swapped pool. Set the timestamp so writeToPool
+        // knows the controller speaks sync and stays in buffered mode.
+        s_artsync_packets++;
+        s_sync_last_ms = millis();
+        s_swap_pending = true;
+        DMXLedRun();                  // signal status LED + notify render task
+    } else if (opcode == 0x2000) {   // ArtPoll
+        sendArtPollReply(packet.remoteIP());
+    }
+}
 
 void initArtnet() {
-    if (artnetSock >= 0) { close(artnetSock); artnetSock = -1; }
-
-    artnetSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (artnetSock < 0) { ESP_LOGE(TAG, "ArtNet socket() failed"); return; }
-
-    int yes = 1;
-    setsockopt(artnetSock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-
-    struct sockaddr_in addr = {};
-    addr.sin_family      = AF_INET;
-    addr.sin_port        = htons(ARTNET_PORT);
-    addr.sin_addr.s_addr = INADDR_ANY;
-
-    if (bind(artnetSock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        ESP_LOGE(TAG, "ArtNet bind() failed: %d", errno);
-        close(artnetSock); artnetSock = -1; return;
+    artnetUdp.close();
+    if (!artnetUdp.listen(ARTNET_PORT)) {
+        ESP_LOGE(TAG, "ArtNet listen(%d) failed", ARTNET_PORT);
+        return;
     }
-
-    int flags = fcntl(artnetSock, F_GETFL, 0);
-    fcntl(artnetSock, F_SETFL, flags | O_NONBLOCK);
-
+    artnetUdp.onPacket(onArtnetPacket);
     ESP_LOGI(TAG, "ArtNet UDP ready (port %d, %d universes)", ARTNET_PORT, universeCount);
 }
 
+uint32_t artnetPacketCount(void) { return s_artnetPackets; }
+
 // Minimal ArtPollReply — lets Resolume/GrandMA/etc. discover the fixture.
-static void sendArtPollReply(const struct sockaddr_in* requester) {
+static void sendArtPollReply(const IPAddress& requester) {
     uint8_t reply[239] = {};
     memcpy(reply, "Art-Net\0", 8);
     reply[8] = 0x00; reply[9] = 0x21;   // OpPollReply = 0x2100 (LE)
@@ -127,35 +258,7 @@ static void sendArtPollReply(const struct sockaddr_in* requester) {
     reply[211] = 1;                             // BindIndex
     reply[212] = 0x08;                          // Status2: sACN capable
 
-    struct sockaddr_in dst = *requester;
-    dst.sin_port = htons(ARTNET_PORT);
-    sendto(artnetSock, reply, sizeof(reply), 0, (struct sockaddr*)&dst, sizeof(dst));
-}
-
-void getArtnetDMX() {
-    if (artnetSock < 0) return;
-    static uint8_t buf[530];
-    struct sockaddr_in sender;
-    socklen_t slen = sizeof(sender);
-    int n;
-    while ((n = recvfrom(artnetSock, buf, sizeof(buf), 0,
-                         (struct sockaddr*)&sender, &slen)) > 0) {
-        if (n < 10 || memcmp(buf, "Art-Net\0", 8) != 0) continue;
-        uint16_t opcode = buf[8] | ((uint16_t)buf[9] << 8);   // LE
-        if (opcode == 0x5000) {   // ArtDMX
-            if (n < 18) continue;
-            uint16_t universe = buf[14] | ((uint16_t)(buf[15] & 0x7F) << 8);
-            uint16_t length   = ((uint16_t)buf[16] << 8) | buf[17];   // BE
-            if (length > 512 || n < 18 + (int)length) continue;
-            if (dmxBufferMutex && xSemaphoreTake(dmxBufferMutex, 0) == pdTRUE) {
-                writeToPool(universe, buf + 18, length);
-                xSemaphoreGive(dmxBufferMutex);
-            }
-            DMXLedRun();
-        } else if (opcode == 0x2000) {   // ArtPoll
-            sendArtPollReply(&sender);
-        }
-    }
+    artnetUdp.writeTo(reply, sizeof(reply), requester, ARTNET_PORT);
 }
 
 // ── sACN / E1.31 (raw lwip UDP socket, multicast per universe) ───────────────
@@ -165,10 +268,13 @@ void getArtnetDMX() {
 #define SACN_PORT     5568
 #define E131_HDR_SIZE 126   // header ends before DMX data (start code at 125, data at 126)
 
-static int sacnSock = -1;
+static int          sacnSock       = -1;
+static TaskHandle_t sacnTaskHandle = NULL;
 
 static const uint8_t E131_MAGIC[12] = {'A','S','C','-','E','1','.','1','7',0,0,0};
 
+// universe parameter is E1.31 (1-indexed); internal pool IDs are 0-indexed.
+// Callers must pass (pool_id + 1) so universe 0 in the UI → joins 239.255.0.1.
 static void sacnJoinUniverse(uint16_t universe) {
     struct ip_mreq mreq = {};
     mreq.imr_multiaddr.s_addr = htonl(0xEFFF0000 | universe);
@@ -177,8 +283,67 @@ static void sacnJoinUniverse(uint16_t universe) {
         ESP_LOGW(TAG, "sACN join u%d failed: %d", universe, errno);
 }
 
+// Dedicated FreeRTOS task on Core 0 — drains the sACN socket with a blocking
+// recv() so packets are processed immediately, independent of the render loop.
+// Mirrors artnetTaskFn; see that function for the rationale.
+static void sacnTaskFn(void* pvParams) {
+    static uint8_t buf[638];   // 126-byte header + up to 512 DMX channels
+    // E1.31 root-layer Vectors (RFC E1.31 §5.2):
+    //   0x00000004 = VECTOR_ROOT_E131_DATA       (regular DMX frame)
+    //   0x00000008 = VECTOR_ROOT_E131_EXTENDED   (sync / discovery)
+    // E1.31 framing-layer Vectors for EXTENDED:
+    //   0x00000001 = VECTOR_E131_EXTENDED_SYNCHRONIZATION
+    //   0x00000002 = VECTOR_E131_EXTENDED_DISCOVERY (ignored here)
+    while (true) {
+        int n = recv(sacnSock, buf, sizeof(buf), 0);
+        if (n < 22) {
+            vTaskDelay(1);  // timeout / socket closed / short packet — yield, retry
+            continue;
+        }
+        if (memcmp(buf + 4, E131_MAGIC, 12) != 0) continue;
+
+        uint32_t root_vec = ((uint32_t)buf[18] << 24) | ((uint32_t)buf[19] << 16) |
+                            ((uint32_t)buf[20] << 8 ) |  buf[21];
+        if (root_vec == 0x00000008) {
+            // Extended packet — sync or discovery. Sync is 49 bytes; discovery
+            // varies but we don't act on it here.
+            if (n < 44) continue;
+            uint32_t frame_vec = ((uint32_t)buf[40] << 24) | ((uint32_t)buf[41] << 16) |
+                                 ((uint32_t)buf[42] << 8 ) |  buf[43];
+            if (frame_vec == 0x00000001) {
+                // sACN sync — same semantic as Art-Net 4 ArtSync: defer the
+                // universe pool swap to dmxApplyPendingSwap() called from the
+                // render task at frame boundary, so consumers see a coherent
+                // multi-universe snapshot.
+                s_sacnsync_packets++;
+                s_sync_last_ms = millis();
+                s_swap_pending = true;
+                DMXLedRun();
+            }
+            continue;
+        }
+        if (root_vec != 0x00000004) continue;   // unknown root vector, drop
+
+        if (n < E131_HDR_SIZE) { vTaskDelay(1); continue; }
+        uint16_t e131_univ = (buf[113] << 8) | buf[114];
+        uint16_t propCount = (buf[123] << 8) | buf[124];   // includes start code
+        uint16_t size      = (propCount > 1) ? (uint16_t)(propCount - 1) : 0;
+        if (size > 512 || n < E131_HDR_SIZE + (int)size) continue;
+        // E1.31 universes are 1-indexed; normalize to 0-indexed to match ArtNet pool
+        uint16_t universe = (e131_univ > 0) ? (uint16_t)(e131_univ - 1) : 0;
+        if (dmxBufferMutex) {
+            xSemaphoreTake(dmxBufferMutex, portMAX_DELAY);
+            writeToPoolSacn(universe, buf + E131_HDR_SIZE, size);
+            xSemaphoreGive(dmxBufferMutex);
+        }
+        DMXLedRun();
+    }
+}
+
 void initE131() {
-    if (sacnSock >= 0) { close(sacnSock); sacnSock = -1; }
+    // Kill previous task and socket if reinitializing
+    if (sacnTaskHandle) { vTaskDelete(sacnTaskHandle); sacnTaskHandle = NULL; }
+    if (sacnSock >= 0)  { close(sacnSock); sacnSock = -1; }
 
     sacnSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sacnSock < 0) { ESP_LOGE(TAG, "sACN socket() failed"); return; }
@@ -196,11 +361,16 @@ void initE131() {
         close(sacnSock); sacnSock = -1; return;
     }
 
-    int flags = fcntl(sacnSock, F_GETFL, 0);
-    fcntl(sacnSock, F_SETFL, flags | O_NONBLOCK);
+    // Blocking socket with receive timeout: the task blocks at recv() until a
+    // packet arrives. The 200 ms timeout lets the task notice socket closure.
+    struct timeval tv = {0, 200000};
+    setsockopt(sacnSock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     for (int i = 0; i < universeCount; i++)
-        sacnJoinUniverse(universePool[i].id);
+        sacnJoinUniverse((uint16_t)(universePool[i].id + 1));  // pool is 0-indexed, E1.31 is 1-indexed
+
+    xTaskCreatePinnedToCore(sacnTaskFn, "sacn_rx", 4096, NULL, 5,
+                            &sacnTaskHandle, 0);  // Core 0: network / lwIP side
 
     ESP_LOGI(TAG, "sACN UDP ready (port %d, %d universes)", SACN_PORT, universeCount);
 }
@@ -217,10 +387,12 @@ void get131DMX() {
     int n;
     while ((n = recv(sacnSock, buf, sizeof(buf), 0)) >= E131_HDR_SIZE) {
         if (memcmp(buf + 4, E131_MAGIC, 12) != 0) continue;
-        uint16_t universe  = (buf[113] << 8) | buf[114];
+        uint16_t e131_univ = (buf[113] << 8) | buf[114];
         uint16_t propCount = (buf[123] << 8) | buf[124];   // includes start code
         uint16_t size      = (propCount > 1) ? (uint16_t)(propCount - 1) : 0;
         if (size > 512 || n < E131_HDR_SIZE + (int)size) continue;
+        // E1.31 universes are 1-indexed; normalize to 0-indexed to match ArtNet pool
+        uint16_t universe = (e131_univ > 0) ? (uint16_t)(e131_univ - 1) : 0;
         if (dmxBufferMutex && xSemaphoreTake(dmxBufferMutex, portMAX_DELAY) == pdTRUE) {
             writeToPoolSacn(universe, buf + E131_HDR_SIZE, size);
             xSemaphoreGive(dmxBufferMutex);
@@ -234,6 +406,11 @@ void get131DMX() {
 static bool ledState = false;
 static unsigned long lastDMXReceivedTime = 0;
 #define LED_TIMEOUT 1000
+#define DMX_ACTIVE_WINDOW_MS 1500
+
+bool dmxIsActive() {
+    return lastDMXReceivedTime != 0 && (millis() - lastDMXReceivedTime) < DMX_ACTIVE_WINDOW_MS;
+}
 
 void DMXLedRun() {
     static unsigned long lastToggleTime = 0;
@@ -286,6 +463,10 @@ void initDmxInputs() {
             ESP_LOGW(TAG, "Invalid DMX input type");
             break;
     }
+#ifdef RAVLIGHT_MODULE_DMX_PHYSICAL_2
+    registerDmxUniverse(dmxConfig.startUniverse + 1);
+    initWiredDmx2();
+#endif
 }
 
 void receiveDmxData() {
@@ -297,13 +478,15 @@ void receiveDmxData() {
 #endif
                 break;
             case ARTNET:
-                getArtnetDMX();
+                // ArtNet is drained by the dedicated artnetTaskFn task (Core 0).
+                // Only forward to DMX physical output if enabled.
 #ifdef RAVLIGHT_MODULE_DMX_PHYSICAL
                 sendDmxData();
 #endif
                 break;
             case SACN:
-                get131DMX();
+                // sACN is drained by the dedicated sacnTaskFn task (Core 0).
+                // Only forward to DMX physical output if enabled.
 #ifdef RAVLIGHT_MODULE_DMX_PHYSICAL
                 sendDmxData();
 #endif
@@ -311,6 +494,9 @@ void receiveDmxData() {
             default:
                 break;
         }
+#ifdef RAVLIGHT_MODULE_DMX_PHYSICAL_2
+        getWiredDMX2();
+#endif
     }
     if (millis() - lastDMXReceivedTime >= LED_TIMEOUT) {
         if (ledState) {
@@ -368,8 +554,10 @@ void sendDmxData() {
 
 void reinitDMXInput() {
     if (!dmxBufferMutex) return;   // called before initDmxInputs() — skip
-    if (artnetSock >= 0) { close(artnetSock); artnetSock = -1; }
-    if (sacnSock   >= 0) { close(sacnSock);   sacnSock   = -1; }
+    // ArtNet uses AsyncUDP — initArtnet() closes and re-listens internally.
+    // sACN still uses a BSD socket + task: kill the task before closing the fd.
+    if (sacnTaskHandle) { vTaskDelete(sacnTaskHandle); sacnTaskHandle = NULL; }
+    if (sacnSock   >= 0) { close(sacnSock); sacnSock = -1; }
 #ifdef RAVLIGHT_MODULE_RECORDER
     stopAutoScene();
 #endif
@@ -392,7 +580,7 @@ void reinitUniverse(uint16_t universe) {
     // For ArtNet, INADDR_ANY receives all universes — no extra action needed.
     if (dmxConfig.dmxInput == SACN) {
         if (sacnSock >= 0)
-            sacnJoinUniverse(universe);
+            sacnJoinUniverse((uint16_t)(universe + 1));  // pool is 0-indexed, E1.31 is 1-indexed
         else
             initE131();
     }
@@ -402,3 +590,40 @@ void reinitUniverse(uint16_t universe) {
 void reinitDMXOutput(bool enable) {
     ESP_LOGI(TAG, "Output %s", enable ? "enabled" : "disabled");
 }
+
+// ── Physical RS-485 DMX port 2 (UART0 / GPIO1/GPIO3) ─────────────────────────
+// Requires RAVLIGHT_DISABLE_SERIAL — UART0 is shared with Serial debug output.
+#ifdef RAVLIGHT_MODULE_DMX_PHYSICAL_2
+
+void initWiredDmx2() {
+    dmx_config_t dmx_config = DMX_CONFIG_DEFAULT;
+    dmx_personality_t personalities[] = { {1, "Default Personality"} };
+    int personality_count = 1;
+    dmx_driver_install(dmxPort2, &dmx_config, personalities, personality_count);
+    dmx_set_pin(dmxPort2, HW_PIN_DMX2_TX, HW_PIN_DMX2_RX, HW_PIN_DMX2_EN);
+    ESP_LOGI(TAG, "Wired DMX port 2 initialized (UART0 GPIO%d/GPIO%d)",
+             HW_PIN_DMX2_TX, HW_PIN_DMX2_RX);
+}
+
+void getWiredDMX2() {
+    dmx_packet_t packet;
+    if (dmx_receive(dmxPort2, &packet, DMX_TIMEOUT_TICK)) {
+        if (!packet.err) {
+            if (!dmxIsConnected2) dmxIsConnected2 = true;
+            static uint8_t buf2[513];
+            if (dmxBufferMutex) xSemaphoreTake(dmxBufferMutex, portMAX_DELAY);
+            dmx_read(dmxPort2, buf2, packet.size);
+            if (dmxBufferMutex) {
+                writeToPool(dmxConfig.startUniverse + 1, buf2 + 1, packet.size - 1);
+                xSemaphoreGive(dmxBufferMutex);
+            }
+            DMXLedRun();
+        } else {
+            ESP_LOGW(TAG, "DMX port 2 packet error");
+        }
+    } else if (dmxIsConnected2) {
+        ESP_LOGW(TAG, "DMX port 2 signal lost");
+    }
+}
+
+#endif // RAVLIGHT_MODULE_DMX_PHYSICAL_2

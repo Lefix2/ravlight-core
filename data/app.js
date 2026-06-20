@@ -1,0 +1,567 @@
+// RavLight SPA shell. Fetches /api/{features,status,config}, populates the form,
+// delegates fixture-specific rendering to window.renderFixture (defined in
+// /fixture.js — the server serves the matching file for the compiled fixture).
+//
+// All state lives in CFG. Save serialises form → JSON → POST /api/config and
+// triggers a restart when the server flags one.
+
+let F = {};       // feature flags
+let CFG = {};     // current config (last seen from server)
+let _statusTimer = null;
+
+// ── Utilities ────────────────────────────────────────────────────────────────
+
+function $(id) { return document.getElementById(id); }
+function setVal(id, v) { const el = $(id); if (el) el.value = (v === undefined || v === null) ? '' : v; }
+function getVal(id)    { const el = $(id); return el ? el.value : ''; }
+function setChk(id, b) { const el = $(id); if (el) el.checked = !!b; }
+function getChk(id)    { const el = $(id); return el ? el.checked : false; }
+
+function formatRuntime(seconds) {
+    const s = Number(seconds) || 0;
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    return h.toString().padStart(2,'0') + ':' + m.toString().padStart(2,'0');
+}
+
+function showToast(msg, ms) {
+    const t = $('toast'); if (!t) return;
+    t.textContent = msg;
+    t.classList.add('show');
+    setTimeout(() => t.classList.remove('show'), ms || 2500);
+}
+
+// ── Init ─────────────────────────────────────────────────────────────────────
+
+async function init() {
+    try {
+        const [features, status, config] = await Promise.all([
+            fetch('/api/features').then(r => r.json()),
+            fetch('/api/status').then(r => r.json()),
+            fetch('/api/config').then(r => r.json()),
+        ]);
+        F = features;
+        CFG = config;
+
+        // Hide elements whose data-mod feature is not compiled in.
+        document.querySelectorAll('[data-mod]').forEach(el => {
+            if (!F[el.dataset.mod]) el.remove();
+        });
+
+        applyStatus(status);
+        applyConfig(config);
+
+        if (typeof window.renderFixture === 'function') {
+            window.renderFixture(config.fixture || {}, F);
+        } else {
+            $('fixtureSection').innerHTML = '<p class="field-note">No fixture renderer loaded.</p>';
+        }
+
+        // Periodic status refresh. Skip when tab is hidden to keep background
+        // load off the ESP32 webserver — every fetch opens a new TCP socket.
+        _statusTimer = setInterval(() => {
+            if (document.visibilityState === 'visible') refreshStatus();
+        }, 10000);
+    } catch (err) {
+        console.error(err);
+        showToast('Failed to load config: ' + err.message);
+    }
+}
+
+function applyStatus(s) {
+    $('hdrBoard').textContent        = s.board || '';
+    $('hdrFw').textContent           = 'FW ' + (s.fw || '');
+    $('fixtureName').textContent     = s.project || 'Fixture';
+    $('titleId').textContent         = s.id || '';
+    $('connMode').textContent        = s.mode || '';
+    $('hdrRuntime').textContent      = formatRuntime(s.runtime);
+    $('hdrTotalRuntime').textContent = formatRuntime(s.total_runtime);
+    if (s.temp !== undefined) $('hdrTemp').textContent = (Number(s.temp).toFixed(1)) + '°C';
+    document.title = 'RavLight ' + (s.id || '');
+    $('fixHeader').textContent = (s.project || 'Fixture');
+
+    // Network info rows
+    const mdns = $('mdnsHost');
+    if (mdns && s.id) {
+        const host = 'rav' + s.id + '.local';
+        mdns.textContent = host;
+        mdns.href = 'http://' + host + '/';
+    }
+    const ipd = $('ipDisplay');
+    if (ipd && s.ip) {
+        ipd.textContent = s.ip;
+        ipd.href = 'http://' + s.ip + '/';
+    }
+
+    // DMX status indicator — yellow when DMX is receiving, green when the
+    // device is reachable but no DMX traffic, gray on fetch failure.
+    setDmxDot(s.dmx_active ? 'dmx' : 'idle');
+
+    // Mobile info popup mirrors
+    const set = (id, v) => { const el = $(id); if (el && v !== undefined) el.textContent = v; };
+    set('infoBoard',   s.board);
+    set('infoFw',      s.fw);
+    set('infoTemp',    s.temp !== undefined ? Number(s.temp).toFixed(1) + '°C' : undefined);
+    set('infoCurrent', formatRuntime(s.runtime));
+    set('infoTotal',   formatRuntime(s.total_runtime));
+}
+
+// Toggle the legacy accordion buttons (we keep their structure for visual parity
+// even though .tabsec .acc-btn is hidden via CSS — needed for non-tab callers).
+function toggleAcc(btn) {
+    const wrap = btn.parentElement;
+    const body = wrap.querySelector('.acc-body');
+    const opening = !btn.classList.contains('open');
+    btn.classList.toggle('open');
+    body.classList.toggle('open');
+    if (!body || !body.classList.contains('open')) {
+        if (body) body.style.maxHeight = '0';
+    } else if (body) {
+        body.style.maxHeight = body.scrollHeight + 'px';
+    }
+}
+
+function applyConfig(c) {
+    const net = c.network || {};
+    setVal('ssid',     net.ssid);
+    setVal('password', net.password);
+    setChk('dhcp',     net.dhcp);
+    setVal('ip',       net.ip);
+    setVal('subnet',   net.subnet);
+    setVal('gateway',  net.gateway);
+
+    const dmx = c.dmx || {};
+    setVal('dmxInput',     dmx.input);
+    setVal('dmxUniverse',  dmx.universe);
+    if (F.dmxPhysical) setChk('dmxOutput', dmx.output);
+    if (F.recorder)    setVal('autoSceneSlot', dmx.autoSceneSlot);
+
+    if (F.effects) {
+        const fx = dmx.effects || {};
+        setVal('fxEffect',    fx.effect);
+        setVal('fxSpeed',     fx.speed);
+        setVal('fxHue',       fx.hue);
+        setVal('fxIntensity', fx.intensity);
+        // Reflect numeric values in live readouts and color picker.
+        const sv = document.getElementById('fxSpeedVal');
+        if (sv) sv.textContent = (fx.speed != null ? fx.speed : 128);
+        const iv = document.getElementById('fxIntensityVal');
+        if (iv) iv.textContent = (fx.intensity != null ? fx.intensity : 255);
+        hueToPicker(fx.hue != null ? fx.hue : 0, fx.intensity != null ? fx.intensity : 255);
+        if (typeof updateEffectsHint === 'function') updateEffectsHint();
+    }
+
+    setVal('ID_fixture', c.ID_fixture);
+    // Show/hide the Effects controls panel based on the current DMX input.
+    if (typeof updateEffectsPanel === 'function') updateEffectsPanel();
+}
+
+// ── Effects helpers ────────────────────────────────────────────────────────
+// The firmware effects engine takes hue (0-255) + intensity. The UI shows a
+// real HTML5 color picker. These translate between the two — saturation is
+// always 100% on the firmware side, so the picker quantises to a full-
+// saturation colour at the chosen intensity.
+function hueToHexRGB(hue, intensity) {
+    // hsv8→rgb mirrors the firmware. Saturation always 255; value = intensity.
+    const h = hue & 0xFF, s = 255, v = (intensity & 0xFF);
+    const region = (h / 43) | 0;
+    const rem    = ((h - region * 43) * 6) | 0;
+    const p = ((v * (255 - s)) >> 8) & 0xFF;
+    const q = ((v * (255 - ((s * rem) >> 8))) >> 8) & 0xFF;
+    const t = ((v * (255 - ((s * (255 - rem)) >> 8))) >> 8) & 0xFF;
+    let r, g, b;
+    switch (region) {
+        case 0:  r = v; g = t; b = p; break;
+        case 1:  r = q; g = v; b = p; break;
+        case 2:  r = p; g = v; b = t; break;
+        case 3:  r = p; g = q; b = v; break;
+        case 4:  r = t; g = p; b = v; break;
+        default: r = v; g = p; b = q; break;
+    }
+    return '#' + ((1 << 24) | (r << 16) | (g << 8) | b).toString(16).slice(1);
+}
+function hexRGBtoHue(hex) {
+    // Return hue (0-255). Saturation drops to grey are mapped to hue 0.
+    const v = hex.replace('#', '');
+    const r = parseInt(v.substr(0, 2), 16);
+    const g = parseInt(v.substr(2, 2), 16);
+    const b = parseInt(v.substr(4, 2), 16);
+    const max = Math.max(r, g, b);
+    const min = Math.min(r, g, b);
+    const d = max - min;
+    if (d === 0) return 0;
+    let h;
+    if (max === r) h = ((g - b) / d) % 6;
+    else if (max === g) h = (b - r) / d + 2;
+    else                h = (r - g) / d + 4;
+    h = Math.round(h * 256 / 6);
+    return ((h % 256) + 256) % 256;
+}
+function hueToPicker(hue, intensity) {
+    const hex = hueToHexRGB(hue, 255);          // picker shows full-bright colour
+    const pk  = document.getElementById('fxColor');
+    if (pk) pk.value = hex;
+    setVal('fxHue', hue);
+    paintColorSwatch(hue, intensity);
+}
+function paintColorSwatch(hue, intensity) {
+    const sw = document.getElementById('fxColorSwatch');
+    if (!sw) return;
+    const hex = hueToHexRGB(hue, intensity);
+    sw.style.background = hex;
+    sw.style.boxShadow  = '0 0 12px ' + hex;
+}
+function onFxColor() {
+    const pk = document.getElementById('fxColor');
+    if (!pk) return;
+    const hue = hexRGBtoHue(pk.value);
+    setVal('fxHue', hue);
+    const intensity = parseInt(getVal('fxIntensity')) || 255;
+    paintColorSwatch(hue, intensity);
+}
+function updateEffectsHint() {
+    const e = parseInt(getVal('fxEffect')) || 0;
+    const h = document.getElementById('fxColorHint');
+    if (!h) return;
+    h.textContent = (e === 0) ? 'fill colour'
+                  : (e === 1) ? '(ignored — rainbow cycles its own hues)'
+                  : (e === 3) ? '(ignored — fire uses its own palette)'
+                  :             'base hue for chase / twinkle';
+}
+// Expose to inline event handlers
+window.onFxColor          = onFxColor;
+window.updateEffectsHint  = updateEffectsHint;
+
+// Effects panel visibility: shown only when dmxInput == EFFECTS (5).
+function updateEffectsPanel() {
+    const sel = $('dmxInput');
+    const fx  = $('effectsPanel');
+    if (!sel || !fx) return;
+    fx.style.display = (parseInt(sel.value) === 5) ? '' : 'none';
+}
+
+// Three-state DMX indicator:
+//   'dmx'  — yellow, DMX traffic incoming on this universe
+//   'idle' — green, device online but no DMX traffic
+//   ''     — gray, device unreachable (fetch failed/timed out)
+function setDmxDot(state) {
+    const dot  = $('dmxStatusDot');
+    const chip = $('dmxStatusChip');
+    const lbl  = $('dmxStatusLbl');
+    if (!dot) return;
+    dot.classList.remove('dmx', 'idle');
+    if (state) dot.classList.add(state);
+    if (chip) {
+        chip.title = state === 'dmx'  ? 'DMX traffic on this universe'
+                   : state === 'idle' ? 'Device online — no DMX traffic'
+                   :                    'Device offline';
+    }
+    if (lbl) {
+        lbl.textContent = state === 'dmx'  ? 'DMX'
+                        : state === 'idle' ? 'NO DMX'
+                        :                    'OFFLINE';
+    }
+}
+
+async function refreshStatus() {
+    try {
+        // 3 s abort budget so a hard-offline device flips the dot to gray
+        // within ~5 s (matches the user request), instead of the browser's
+        // default minute-long fetch timeout.
+        const ac = new AbortController();
+        const t  = setTimeout(() => ac.abort(), 3000);
+        const s = await fetch('/api/status', {signal: ac.signal}).then(r => r.json());
+        clearTimeout(t);
+        // Only touch the runtime widgets — don't overwrite form fields.
+        $('hdrRuntime').textContent      = formatRuntime(s.runtime);
+        $('hdrTotalRuntime').textContent = formatRuntime(s.total_runtime);
+        if (s.temp !== undefined) $('hdrTemp').textContent = Number(s.temp).toFixed(1) + '°C';
+        setDmxDot(s.dmx_active ? 'dmx' : 'idle');
+    } catch (e) {
+        // Fetch failed → device offline. Show gray (no class).
+        setDmxDot('');
+    }
+}
+
+// ── Tabs ─────────────────────────────────────────────────────────────────────
+
+function showTab(name) {
+    document.querySelectorAll('.tabsec').forEach(s => s.classList.toggle('active', s.id === 'tab-' + name));
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+}
+
+// ── Save ─────────────────────────────────────────────────────────────────────
+
+function buildPayload() {
+    const payload = {
+        ID_fixture: getVal('ID_fixture'),
+        network: {
+            ssid:     getVal('ssid'),
+            password: getVal('password'),
+            dhcp:     getChk('dhcp'),
+            ip:       getVal('ip'),
+            subnet:   getVal('subnet'),
+            gateway:  getVal('gateway'),
+        },
+        dmx: {
+            input:    parseInt(getVal('dmxInput')) || 0,
+            universe: parseInt(getVal('dmxUniverse')) || 0,
+        },
+    };
+    if (F.dmxPhysical) payload.dmx.output = getChk('dmxOutput');
+    if (F.recorder)    payload.dmx.autoSceneSlot = parseInt(getVal('autoSceneSlot')) || 0;
+    if (F.effects) payload.dmx.effects = {
+        effect:    parseInt(getVal('fxEffect'))    || 0,
+        speed:     parseInt(getVal('fxSpeed'))     || 128,
+        hue:       parseInt(getVal('fxHue'))       || 0,
+        intensity: parseInt(getVal('fxIntensity')) || 255,
+    };
+    if (typeof window.getFixtureData === 'function') {
+        const f = window.getFixtureData(F);
+        if (f !== undefined && f !== null) payload.fixture = f;
+    }
+    return payload;
+}
+
+async function saveAll() {
+    const btn = $('saveBtn');
+    btn.disabled = true; btn.textContent = 'Saving…';
+    try {
+        const res = await fetch('/api/config', {
+            method:  'POST',
+            headers: {'Content-Type': 'application/json'},
+            body:    JSON.stringify(buildPayload()),
+        });
+        const j = await res.json();
+        if (j.ok) {
+            if (j.restart_needed) restartDevice();
+            else                  showToast('Saved');
+        } else {
+            showToast('Save failed: ' + (j.error || 'unknown'));
+        }
+    } catch (err) {
+        showToast('Save error: ' + err.message);
+    } finally {
+        btn.disabled = false; btn.textContent = 'Save config';
+    }
+}
+
+// ── Actions ─────────────────────────────────────────────────────────────────
+
+async function restartDevice() {
+    // Resolve the redirect target before kicking the restart so we can show it
+    // in the overlay. Prefer the new mDNS host (in case the user just edited
+    // ID_fixture) over the current IP.
+    const newId = getVal('ID_fixture');
+    const host  = (newId && newId.length) ? ('rav' + newId + '.local') : window.location.host;
+    showRestartOverlay(host);
+    try { await fetch('/restart', {method: 'POST'}); } catch (e) {}
+}
+
+function showRestartOverlay(host) {
+    const overlay = $('restartOverlay');
+    if (!overlay) return;
+    const hostEl = $('restartHost');
+    if (hostEl) hostEl.textContent = host;
+    overlay.classList.add('open');
+    let n = 10;
+    const cd = $('restartCountdown');
+    if (cd) cd.textContent = n;
+    const t = setInterval(() => {
+        n--;
+        if (cd) cd.textContent = n;
+        if (n <= 0) {
+            clearInterval(t);
+            location.href = 'http://' + host + '/';
+        }
+    }, 1000);
+}
+
+// Live-update the title fixture id and mDNS link as the user edits the ID field.
+function updateMDNS() {
+    const id = getVal('ID_fixture');
+    const t = $('titleId'); if (t) t.textContent = id || '—';
+    const m = $('mdnsHost');
+    if (m && id) {
+        const h = 'rav' + id + '.local';
+        m.textContent = h;
+        m.href = 'http://' + h + '/';
+    }
+}
+
+function openResetModal()  { $('resetModal').classList.add('open'); }
+function closeResetModal() { $('resetModal').classList.remove('open'); }
+
+function toggleInfoPopup() { $('infoPopup').classList.toggle('open'); }
+
+function toggleDevices() {
+    const p = $('devicesPanel'); if (p) p.classList.toggle('open');
+    const b = $('devicesBtn');   if (b) b.classList.toggle('active');
+}
+
+async function scanDevices() {
+    const btn    = $('scanDevicesBtn');
+    const status = $('scanStatus');
+    const tbody  = document.querySelector('#deviceTable tbody');
+    const espnow = ($('espnowScan') || {checked: false}).checked;
+    if (btn) btn.disabled = true;
+    if (status) status.textContent = espnow ? 'ESP-NOW scan…' : 'Scanning…';
+    if (tbody) tbody.innerHTML = '<tr><td colspan="3" style="color:var(--txt4);text-align:center;padding:12px">Waiting for responses…</td></tr>';
+    let info;
+    try {
+        info = await fetch(espnow ? '/discover?espnow=1' : '/discover').then(r => r.json());
+    } catch (e) { if (status) status.textContent = 'Scan failed'; if (btn) btn.disabled = false; return; }
+    const disrupted  = !!info.wifiDisrupted;
+    const duration   = info.duration || 4500;
+    const firstDelay = disrupted ? duration + 2000 : 1600;
+    if (disrupted && status) status.textContent = 'WiFi suspended, scanning…';
+    let pollCount = 0;
+    const pollOnce = async () => {
+        pollCount++;
+        try {
+            const devices = await fetch('/devices').then(r => r.json());
+            if (devices.length > 0) renderDevices(devices);
+            if (pollCount >= 3) {
+                if (btn) btn.disabled = false;
+                if (status) status.textContent = devices.length + ' device' + (devices.length === 1 ? '' : 's');
+            } else {
+                setTimeout(pollOnce, 1500);
+            }
+        } catch (e) {
+            if (btn) btn.disabled = false;
+            if (status) status.textContent = 'poll failed';
+        }
+    };
+    setTimeout(pollOnce, firstDelay);
+}
+
+function renderDevices(devices) {
+    const tbody = document.querySelector('#deviceTable tbody');
+    if (!tbody) return;
+    if (!devices.length) {
+        tbody.innerHTML = '<tr><td colspan="3" style="color:var(--txt4);text-align:center;padding:12px">No devices found.</td></tr>';
+        return;
+    }
+    tbody.innerHTML = '';
+    devices.forEach(d => {
+        const row = document.createElement('tr');
+        row.innerHTML =
+            '<td><b>' + (d.id || '—') + '</b></td>' +
+            '<td><a href="http://' + d.ip + '" target="_blank" style="color:var(--txt3);text-decoration:none">' + d.ip + '</a></td>' +
+            '<td><img src="/Iicon.png" style="width:18px;height:18px;cursor:pointer;opacity:.6" title="View Details"></td>';
+        row.querySelector('img').addEventListener('click', e => { e.stopPropagation(); openDevicePopup(d); });
+        tbody.appendChild(row);
+    });
+}
+
+function openDevicePopup(d) {
+    $('popupFixture').textContent = d.fixture || '—';
+    $('popupId').textContent      = d.id || '—';
+    $('popupMode').textContent    = d.mode || '—';
+    $('popupIp').textContent      = d.ip || '—';
+    $('popupMac').textContent     = d.mac || '—';
+    $('popupFw').textContent      = d.fw || '—';
+    $('popupTemp').textContent    = (d.temp > 0) ? d.temp.toFixed(1) + '°C' : '—';
+    $('popupUptime').textContent  = formatUptime(d.uptime);
+    const hw = d.hwMac || '', ip = d.ip || '';
+    $('popupActions').innerHTML =
+        '<button type="button" class="pop-btn" onclick="window.open(\'http://' + ip + '/\',\'_blank\')">Open UI &rarr;</button>' +
+        '<button type="button" class="pop-btn" onclick="sendDeviceCmd(\'' + ip + '\',\'HIGHLIGHT\',\'' + hw + '\')">Highlight</button>' +
+        '<button type="button" class="pop-btn danger" onclick="sendDeviceCmd(\'' + ip + '\',\'RESET\',\'' + hw + '\')">Reset config</button>';
+    $('devicePopup').classList.add('open');
+}
+
+function closeDevicePopup() { $('devicePopup').classList.remove('open'); }
+
+async function sendDeviceCmd(ip, cmd, hwMac) {
+    const fd = new FormData();
+    fd.append('ip', ip); fd.append('command', cmd);
+    if (hwMac) fd.append('hwmac', hwMac);
+    try {
+        const r = await fetch('/device-cmd', {method: 'POST', body: fd});
+        showToast(r.ok ? cmd + ' sent' : cmd + ' failed');
+    } catch (e) { showToast(cmd + ' error'); }
+}
+
+function formatUptime(seconds) {
+    const s = Number(seconds) || 0;
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    return h + 'h ' + m + 'm';
+}
+
+async function confirmReset() {
+    closeResetModal();
+    try { await fetch('/reset', {method: 'POST'}); } catch (e) {}
+    showToast('Resetting to defaults…');
+    setTimeout(() => location.reload(), 3000);
+}
+
+function openDmxMonitor() { window.open('/dmxmonitor', '_blank'); }
+
+async function scanWifi() {
+    showToast('Scanning…');
+    try { await fetch('/scanWiFi'); } catch (e) {}
+    let tries = 0;
+    const poll = setInterval(async () => {
+        tries++;
+        try {
+            const list = await fetch('/getWiFiList').then(r => r.json());
+            if (list && list.length) {
+                clearInterval(poll);
+                const dl = $('wifi-networks');
+                if (dl) {
+                    dl.innerHTML = '';
+                    list.forEach(ssid => { const o = document.createElement('option'); o.value = ssid; dl.appendChild(o); });
+                }
+                showToast(list.length + ' networks found');
+            }
+        } catch (e) { /* keep polling */ }
+        if (tries > 6) clearInterval(poll);
+    }, 1500);
+}
+
+// Configuration import/export
+async function downloadJSON() {
+    try {
+        const cfg = await fetch('/api/config').then(r => r.json());
+        const blob = new Blob([JSON.stringify(cfg, null, 2)], {type: 'application/json'});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = 'ravlight-' + (cfg.ID_fixture || 'config') + '.json';
+        a.click();
+        URL.revokeObjectURL(url);
+    } catch (e) { showToast('Download failed'); }
+}
+
+async function uploadJSON() {
+    const file = $('jsonUpload').files[0];
+    if (!file) { showToast('Pick a .json file first'); return; }
+    try {
+        const text = await file.text();
+        const cfg  = JSON.parse(text);
+        const res  = await fetch('/api/config', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body:    JSON.stringify(cfg),
+        });
+        const j = await res.json();
+        if (j.ok) {
+            showToast('Imported');
+            if (j.restart_needed) restartDevice();
+            else                  setTimeout(() => location.reload(), 500);
+        } else {
+            showToast('Import failed');
+        }
+    } catch (e) { showToast('Invalid JSON'); }
+}
+
+async function startRecording() {
+    const slot = parseInt(getVal('autoSceneSlot')) || 0;
+    try {
+        await fetch('/startRecording?scene=' + slot);
+        showToast('Recording scene ' + (slot + 1));
+    } catch (e) { showToast('Failed to start recording'); }
+}
+
+window.addEventListener('DOMContentLoaded', init);

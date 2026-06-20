@@ -7,10 +7,15 @@
 #include <driver/gpio.h>
 #include "config.h"
 #include "fixture_config.h"
+#ifdef RAVLIGHT_MODULE_EFFECTS
+#include "effects.h"
+#endif
+#ifdef RAVLIGHT_MODULE_NFC
+  #include "nfc.h"
+#endif
 
 #define TAG                    "CFG"
 #define RESET_HOLD_TIME        10000   // ms — factory reset
-#define BLE_SHORT_PRESS_TIME   1000    // ms — re-open BLE window
 #define CONFIG_VERSION         2
 #define NVS_NAMESPACE    "ravlight"
 #define NVS_KEY          "config"
@@ -70,6 +75,13 @@ static void serializeDmx(JsonObject& dmx) {
 #ifdef RAVLIGHT_MODULE_RECORDER
     dmx["autoSceneSlot"] = dmxConfig.autoSceneSlot;
 #endif
+#ifdef RAVLIGHT_MODULE_EFFECTS
+    JsonObject fx = dmx.createNestedObject("effects");
+    fx["effect"]    = effectsConfig.effect;
+    fx["speed"]     = effectsConfig.speed;
+    fx["hue"]       = effectsConfig.hue;
+    fx["intensity"] = effectsConfig.intensity;
+#endif
 }
 
 static void serializeFixture(JsonObject& fix) {
@@ -96,6 +108,14 @@ static void deserializeDmx(const JsonObject& dmx) {
 #endif
 #ifdef RAVLIGHT_MODULE_RECORDER
     dmxConfig.autoSceneSlot = dmx["autoSceneSlot"] | 0;
+#endif
+#ifdef RAVLIGHT_MODULE_EFFECTS
+    JsonObjectConst fx = dmx["effects"].as<JsonObjectConst>();
+    effectsConfig.effect    = fx["effect"]    | (uint8_t)EFFECT_SOLID;
+    effectsConfig.speed     = fx["speed"]     | (uint8_t)128;
+    effectsConfig.hue       = fx["hue"]       | (uint8_t)0;
+    effectsConfig.intensity = fx["intensity"] | (uint8_t)255;
+    if (effectsConfig.effect >= EFFECT_COUNT) effectsConfig.effect = EFFECT_SOLID;
 #endif
 }
 
@@ -145,6 +165,18 @@ static void initNVSFlash() {
         nvs_flash_erase();
         nvs_flash_init();
     }
+}
+
+// ── Public JSON helpers ──────────────────────────────────────────────────────
+
+void buildConfigJson(DynamicJsonDocument& doc) {
+    doc["version"] = CONFIG_VERSION;
+    JsonObject net = doc.createNestedObject("network");
+    serializeNetwork(net);
+    JsonObject dmx = doc.createNestedObject("dmx");
+    serializeDmx(dmx);
+    JsonObject fix = doc.createNestedObject("fixture");
+    serializeFixture(fix);
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────
@@ -241,16 +273,7 @@ void loadConfig() {
 
 void saveConfig() {
     DynamicJsonDocument doc(4096);
-    doc["version"] = CONFIG_VERSION;
-
-    JsonObject net = doc.createNestedObject("network");
-    serializeNetwork(net);
-
-    JsonObject dmx = doc.createNestedObject("dmx");
-    serializeDmx(dmx);
-
-    JsonObject fix = doc.createNestedObject("fixture");
-    serializeFixture(fix);
+    buildConfigJson(doc);
 
     char* buf = (char*)malloc(NVS_BUF_SIZE);
     if (!buf) { ESP_LOGE(TAG, "saveConfig: out of memory"); return; }
@@ -265,18 +288,17 @@ void saveConfig() {
     } else {
         ESP_LOGE(TAG, "Failed to open NVS for writing");
     }
-
     free(buf);
+
+#ifdef RAVLIGHT_MODULE_NFC
+    nfcOnConfigSaved();
+#endif
 }
 
 void resetConfig() {
     ESP_LOGI(TAG, "Resetting to defaults");
     loadDefaultConfig();
 }
-
-#ifdef RAVLIGHT_MODULE_BLE
-  #include "ble_manager.h"
-#endif
 
 #ifdef RAVLIGHT_MODULE_RESET
 void checkResetButton() {
@@ -295,16 +317,6 @@ void checkResetButton() {
             esp_restart();
         }
     } else {
-        if (buttonPressStart != 0 && !buttonWasHeld) {
-            uint32_t now  = (uint32_t)(esp_timer_get_time() / 1000ULL);
-            uint32_t held = now - buttonPressStart;
-            if (held >= BLE_SHORT_PRESS_TIME) {
-                ESP_LOGI(TAG, "Short press — re-opening BLE window");
-#ifdef RAVLIGHT_MODULE_BLE
-                initBLE();
-#endif
-            }
-        }
         buttonPressStart = 0;
         buttonWasHeld    = false;
     }

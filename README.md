@@ -82,7 +82,8 @@ Always compiled. Provides networking (Ethernet + WiFi + SoftAP fallback), multi-
 | Fixture | Description | Status |
 |---|---|---|
 | **Veyron** | Pixel bar — 40× WS2811 RGB + 2× P9813 accent; 5 DMX personalities; strobe and highlight animations | Stable |
-| **Elyon** | Multi-output LED controller — 2 to 15 outputs per board, each independently configurable; WS2811 / WS2812B / SK6812 / WS2814 RGBW, PWM dimmer, relay; per-output color order, brightness, grouping, multi-universe span | Alpha |
+| **Elyon** | Multi-output LED controller — 2 to 15 outputs per board, each independently configurable; WS2811 / WS2812B / SK6812 / WS2814 / WS2815 / TM1814 / TM1914 RGBW, APA102 / SK9822 / P9813 clocked chipsets, PWM dimmer, relay; per-output color order, brightness, grouping, multi-universe span; I2S parallel backend (default) or RMT per-channel | Alpha |
+| **Orion** | Motorized winch — TMC2209 stepper (LED Lifter v5): DMX position/speed with 3 personalities, sensorless StallGuard homing, manual jog, DMX-loss watchdog, mechanical calibration, plus optional WS281x LED outputs driven alongside the motor | Alpha (hardware pending) |
 | **Axon** | ArtNet / sACN → RS-485 DMX node | Planned |
 
 ---
@@ -99,6 +100,7 @@ Board files live in `boards/` and are force-included at compile time via `-inclu
 | QuinLED AN-Penta Deca | `quinled_penta_deca_elyon` | 15 × PWM | WiFi only | `elyon_quinled_penta_deca_vX.Y.Z.bin` |
 | Gledopto Elite 4D-EXMU (GL-C-618WL) | `gledopto_elite4d_elyon` | 4 × pixel/PWM | LAN8720 ETH + WiFi | `elyon_gledopto_elite4d_vX.Y.Z.bin` |
 | Gledopto Elite 2D-EXMU (GL-C-616WL) | `gledopto_elite2d_elyon` | 2 × pixel/PWM | LAN8720 ETH + WiFi | `elyon_gledopto_elite2d_vX.Y.Z.bin` |
+| LED Lifter v5 (ESP32-WROOM-32E) | `led_lifter_v5_orion` | TMC2209 winch + 4 × pixel | LAN8720 ETH + WiFi | `orion_led_lifter_v5_vX.Y.Z.bin` |
 
 ---
 
@@ -170,6 +172,7 @@ Each build produces a **single merged binary** in `release/` that combines bootl
 | QuinLED AN-Penta Deca | `elyon_quinled_penta_deca_vX.Y.Z.bin` |
 | Gledopto Elite 4D-EXMU | `elyon_gledopto_elite4d_vX.Y.Z.bin` |
 | Gledopto Elite 2D-EXMU | `elyon_gledopto_elite2d_vX.Y.Z.bin` |
+| LED Lifter v5 (Orion) | `orion_led_lifter_v5_vX.Y.Z.bin` |
 | XDMX rev2.2 | `veyron_xdmx2_vX.Y.Z.bin` |
 
 7. Click **Program** and wait for completion
@@ -179,10 +182,16 @@ Each build produces a **single merged binary** in `release/` that combines bootl
 #### Option B — command line
 
 ```bash
-esptool.py --chip esp32 write_flash --compress 0x0 release/elyon_quinled_octa_vX.Y.Z.bin
+esptool.py --chip esp32 write_flash --compress 0x0 release/elyon/vX.Y.Z/elyon_quinled_octa_vX.Y.Z.bin
 ```
 
-> **Subsequent OTA updates** — once the device is on the network, use the **Settings → OTA** page in the web UI to upload `_fw_vX.Y.Z.bin` (firmware only, no full reflash needed).
+Release artefacts are grouped per fixture: `release/{veyron,elyon,orion}/vX.Y.Z/`. Each folder contains three binaries per board — the merged `*_vX.Y.Z.bin` for first-time flashing, plus `*_fw_vX.Y.Z.bin` and `*_fs_vX.Y.Z.bin` for OTA.
+
+> **Subsequent OTA updates** — once the device is on the network, open the **Settings → OTA** page in the web UI and upload **two files** (ElegantOTA handles one partition at a time):
+> 1. `*_fw_vX.Y.Z.bin` — select "Firmware"
+> 2. `*_fs_vX.Y.Z.bin` — select "Filesystem"
+>
+> Order doesn't matter, but updating the firmware first is recommended so the new web UI matches the new backend. The device reboots after each upload.
 
 ---
 
@@ -197,6 +206,7 @@ esptool.py --chip esp32 write_flash --compress 0x0 release/elyon_quinled_octa_vX
 | Scene Recorder (4 slots, loop playback) | ✅ |
 | Veyron fixture — WS2811 + P9813, 5 personalities | ✅ |
 | Elyon fixture — 2–15 outputs, pixel/PWM/relay, RGBW | ✅ Alpha |
+| Orion fixture — TMC2209 winch + LED outputs, StallGuard calibration wizard | 🧪 Alpha (hardware pending) |
 | QuinLED Dig-Octa / Penta Plus / Penta Deca boards | ✅ |
 | Gledopto Elite 4D / 2D-EXMU boards | ✅ |
 | Board-specific first-boot output presets | ✅ |

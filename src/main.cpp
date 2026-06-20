@@ -10,6 +10,8 @@
 #include "dmx_manager.h"
 #include <esp_ota_ops.h>
 
+
+
 #ifdef RAVLIGHT_MODULE_RECORDER
   #include "dmx_recorder.h"
 #endif
@@ -19,30 +21,53 @@
 #ifdef RAVLIGHT_MODULE_TEMP
   #include "temp_sensor.h"
 #endif
-#ifdef RAVLIGHT_MODULE_BLE
-  #include "ble_manager.h"
+#ifdef RAVLIGHT_MODULE_NFC
+  #include "nfc.h"
+#endif
+#ifdef RAVLIGHT_MODULE_TEST_PATTERN
+  #include "test_pattern.h"
+#endif
+#ifdef RAVLIGHT_MODULE_EFFECTS
+  #include "effects.h"
 #endif
 
 void setup() {
+#ifndef RAVLIGHT_DISABLE_SERIAL
     Serial.begin(115200);
+#endif
 #ifdef RAVLIGHT_MODULE_DISCOVERY
     esp_log_level_set("DISC", ESP_LOG_INFO);
     esp_log_level_set("UDP",  ESP_LOG_INFO);
 #endif
     delay(200);
+#ifndef RAVLIGHT_DISABLE_SERIAL
     Serial.println("");
     Serial.println("RavLight " + String(PROJECT_NAME) + " " + FW_VERSION);
     Serial.println("Limitless creativity");
     Serial.println("R&D by @Ravision92");
     Serial.println("=^.^=");
+#endif
 
     intiConfig();
     initRuntime();
+
+#ifdef RAVLIGHT_MODULE_NFC
+    initNFC();
+    nfcBootSync();
+#endif
 
     initFixture();
 
     initEthernet();
     initDmxInputs();
+
+#ifdef RAVLIGHT_MODULE_TEST_PATTERN
+    initTestPattern();
+#endif
+
+#ifdef RAVLIGHT_MODULE_EFFECTS
+    initEffects();
+#endif
 
     #ifdef RAVLIGHT_MODULE_TEMP
       initTemperatureSensor();
@@ -51,10 +76,6 @@ void setup() {
     initWebServer();
     initUDP();
     initESPNow();
-#ifdef RAVLIGHT_MODULE_BLE
-    initBLE();
-    saveConfig();  // re-save RAM config to NVS in case NimBLE erased it during init
-#endif
 
     delay(300);
 
@@ -65,6 +86,14 @@ void setup() {
 
 void loop() {
     receiveDmxData();
+
+#ifdef RAVLIGHT_MODULE_TEST_PATTERN
+    tickTestPattern();
+#endif
+
+#ifdef RAVLIGHT_MODULE_EFFECTS
+    tickEffects();
+#endif
 
     handleDMX();
 
@@ -82,8 +111,8 @@ void loop() {
 #ifdef RAVLIGHT_MODULE_DISCOVERY
     updateCombinedDiscovery();
 #endif
-#ifdef RAVLIGHT_MODULE_BLE
-    updateBLE();
+#ifdef RAVLIGHT_MODULE_NFC
+    nfcLoop();
 #endif
 }
 

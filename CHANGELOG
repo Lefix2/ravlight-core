@@ -5,6 +5,100 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [2.20.4] — 2026-06-20
+
+### Added
+- **Art-Net 4 ArtSync support** — controllers that emit ArtSync packets (Resolume, MA3, Chamsys, ETC EOS over Art-Net, …) now drive frame-coherent rendering: every universe in a frame becomes visible atomically instead of trickling in as ArtDMX packets arrive. The universe pool is double-buffered internally; render reads the active half lock-free. Legacy controllers without sync (xLights, etc.) automatically fall back to the previous inline-apply behaviour
+- **sACN Extended Synchronization** — same frame-coherent semantics for E1.31 controllers (grandMA3 onPC, ETC EOS, Chamsys, Hog OPC, …). Detected via VECTOR_E131_EXTENDED_SYNCHRONIZATION (framing vector 0x00000001) and routed through the same pool-swap mechanism as ArtSync
+- **Per-output gamma correction (Elyon)** — new `gamma_x10` field per LED output: 10 = linear (default, backward compat), 22 = γ 2.2 (typical LED perceptual linearisation), range 10..30. Baked into the existing per-output 256-byte brightness LUT, so the per-pixel render cost remains a single table lookup
+- **`/stats` runtime perf endpoint** — JSON snapshot of render FPS, average / peak frame time, mutex wait time, per-universe heap counters, ArtNet pps, ArtSync and sACN sync counts. `POST /stats/reset` zeroes the accumulators for clean A/B measurement
+- **Elyon dual-core render task** — LED rendering runs on a dedicated FreeRTOS task pinned to Core 0, woken by xTaskNotifyGive or a 20 ms safety tick. Frees Core 1 (Arduino loop) from re-rendering on every iteration. Mutex hold time during render dropped from full-frame (~35 ms) to ~5 µs swap window
+
+### Performance
+Measured on QuinLED Octa under Resolume ArtNet load (8 × 325 px, 16 universes):
+- Render-time tail latency `render_us_max`: 103 ms → 47 ms (-54%)
+- Mutex contention `mutex_wait_max`: 2.85 ms → 874 µs (-69%)
+- ArtNet packet ingestion: roughly doubled
+- Minimum free heap: 85 KB → 91 KB (the per-universe double buffer adds 16 KB; the rest is recovered from less heap thrash)
+
+Steady-state FPS is unchanged at ~28 — the hpwit `showPixels(WAIT)` blocking flush is the hard ceiling (matches sun-lightrig-led-controller's ~40 fps for 340 px on SPI). The wins live in coherency and consistency.
+
+### Changed
+- **Per-pixel brightness math replaced by precomputed LUT** (Elyon) — pulled the multiply-divide off the render hot path. Universe pointer caching added to the I2S branch (was per-pixel `getUniverseData()` linear scan), matching the RMT branch's behaviour. Also fixes a latent cross-universe-boundary bug in the I2S WS path
+- **I2S DMA copy uses bulk memcpy** instead of a per-pixel `setPixel()` loop when source and device wire widths match (the common case). 4-8× faster than the function-call-per-pixel loop on aligned DMA buffers
+
+---
+
+## [2.20.3] — 2026-06-19
+
+### Changed
+- **I2S parallel LED backend is now the default for every Elyon env.** The `[ravlight].elyon_i2s_flag` toggle ships ON; flipping it back to empty rolls every Elyon env back to the RMT backend. Boards that don't use pixel LEDs (analog PWM Penta+, Penta Deca) are unaffected — the I2S init finds zero WS281x outputs and is a no-op
+- **BLE module removed.** The on-device NimBLE provisioning never reached working state and is no longer planned: the mobile app will use UDP discovery + WiFi config over the existing web UI. Removes the NimBLE library from the build, the `RAVLIGHT_MODULE_BLE` guards from the source, and `src/ble_manager.*` from the tree. Drops ~5 s build time and ~50 KB of compiled code per env
+
+---
+
+## [2.20.2] — 2026-06-19
+
+### Changed
+- **Elyon I2S backend is now a build-time toggle, not a separate env.** Removed `quinled_octa_elyon_i2s` and `generic_esp32_test_elyon_i2s`; both are now produced by setting `elyon_i2s_flag` and `elyon_i2s_lib` in the `[ravlight]` section at the top of `platformio.ini`. Flips every Elyon env to the I2S parallel backend at once
+- **Build matrix shrinks** from 10 envs to 8 (one per board, no duplicates)
+
+---
+
+## [2.20.1] — 2026-06-19
+
+### Added
+- **Orion setup wizard** — guided 5-step procedure (Mechanical → Direction → Run home → Travel limits → Profile sweep) with every control inline. Each step polls live state and ticks off when the operator completes the action. Re-runnable any time from the Calibration card; manual entry treats every step as "to redo"
+- **Profile sweep auto-derives operSgthrs** — the operational StallGuard threshold is now computed automatically at the end of a successful 8-bin × 2-direction sweep (worst-case mean − 3·stddev). No separate calibration step needed
+- **Auto-rehome on Clear Fault** — opt-in Orion Safety toggle: when the operator presses Clear Fault (UI button or DMX function byte 100-149) and the option is on, the fixture automatically starts homing after the fault is cleared. Operator stays in full control; no autonomous motion
+- **DMX status badge** — header chip shows three states (DMX present / no DMX / OFFLINE) with green / yellow / grey colours
+- **Per-universe DMX-loss watchdog** — fixtures can now arm their watchdog on a specific universe instead of "any DMX traffic"; Orion uses this so a silent motor universe still trips the return-home action while other universes keep playing
+
+### Changed
+- **Background.jpg** — recompressed from 141 KB to 25 KB (953×1200 progressive JPEG quality 72). First paint of the web UI is noticeably faster
+- **Release artefacts** — `release/` is now organised per fixture: `release/veyron/v<ver>/`, `release/elyon/v<ver>/`, `release/orion/v<ver>/`
+- **Manual jog "Override"** — now also suspends StallGuard stall detection, not just soft-limit enforcement. Lets the operator redefine travel limits without false stall trips when no profile is calibrated yet
+- **Elyon render task** — LED rendering runs on a dedicated FreeRTOS task pinned to Core 0, woken by xTaskNotifyGive or a 20 ms safety tick. Frees the main loop on Core 1 from re-rendering on every iteration
+
+### Fixed
+- **Spurious restart on Save** — saving the configuration on Orion no longer schedules a restart when nothing actually changed
+- **`generic_esp32_test_elyon_i2s` build** — missing I2SClocklessLedDriver dependency now declared in `platformio.ini`
+
+---
+
+## [2.20.0] — 2026-06-03
+
+### Added
+- **Clocked LED chipsets** — Elyon now supports APA102, SK9822 and P9813 in addition to the WS281x family. Clocked chipsets use two pins (data + clock); pick the partner output for CLOCK from a dropdown on the same card, and the partner output is marked as "Used as CLOCK" with its config greyed out
+- **I2S parallel LED backend (opt-in)** — new `RAVLIGHT_MODULE_I2S_LED` build flag routes all WS281x outputs through a single I2S0 peripheral instead of one RMT channel per output. Lifts the per-output pixel cap from 500 to 1024 pixels; total pixel budget from 4096 to 8192. Default builds are unchanged (RMT). Contributed by Felix Trefou (@Lefix2)
+- **Bring-up build** — new `env:generic_esp32_test_elyon` / `env:generic_esp32_test_elyon_i2s` builds for a plain ESP32-WROOM with no Ethernet or DMX controller; an internal walking-byte pattern drives every output at 40 fps so the signal path can be validated on a logic analyzer
+
+### Changed
+- **Web UI rendering** — the configuration page is now streamed in chunks as it is built, so it no longer truncates on devices with fragmented memory after long uptimes. Previously the page could stop mid-script, leaving the Save button and tab navigation broken until reboot
+- **Elyon Relay** — new "Active-low (invert output)" toggle in the Relay section for relay modules wired active-low; the per-channel Brightness field is hidden when protocol is Relay since it has no effect there
+- **WS2814 / WS2815 / TM1814 / TM1914 protocol options** added to the Elyon protocol dropdown
+
+---
+
+## [2.19.0] — 2026-05-29
+
+### Added
+- **Orion winch fixture (alpha)** — motorized winch control on the LED Lifter v5 board (TMC2209 stepper): DMX position and speed with three personalities, sensorless StallGuard homing, hold-to-jog manual control, a DMX-loss watchdog (E-stop or return-home), mechanical calibration (drum diameter / gear ratio / steps-per-rev → cm), soft travel limits, and a cm/inch unit selector
+- **LED outputs on Orion** — Orion can drive WS281x LED strips alongside the motor; each output is configured independently (protocol, pixel count, universe, start channel, brightness, color order, grouping, invert) from a dedicated LED tab
+- **StallGuard calibration wizard** — guided pop-up that tunes the stall threshold against the real hung load (no-load reading → loaded reading), with the result saved on the device
+- **Per-output LED highlight** — a "Highlight" button on each LED output runs a white wipe along the strip to identify it (Elyon and Orion)
+- **Tabbed configuration UI** — Network / DMX / Fixture / Settings are now tabs instead of stacked accordions; on Orion the fixture splits into separate Motor and LED tabs; each motor section is a collapsible card with a live summary
+
+### Changed
+- **RavLight logo** restored in the page header (previously plain text), on both the config page and the DMX Monitor
+- **Header on phones** — runtime counters and board name are hidden on small screens to reduce clutter
+- **DMX section** now explains that the Start Universe applies to the fixture's main block, while LED outputs use their own per-output universe
+
+### Fixed
+- **DMX Monitor universe selector showed "0 / NaN" on Orion** — the fixture channel map now uses the universe→ranges schema the monitor expects, so the selector lists the real universes and highlights fixture channels correctly
+
+---
+
 ## [2.18.0] — 2026-05-12
 
 ### Added

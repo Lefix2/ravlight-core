@@ -6,9 +6,12 @@
 #include <ElegantOTA.h>
 #include "runtime.h"
 #include <ArduinoJson.h>
+#include <AsyncJson.h>
 #include <Ticker.h>
 #include "dmx_manager.h"
+#include "core/stats.h"
 #include <memory>
+#include <WiFi.h>
 
 #ifdef RAVLIGHT_MODULE_ETHERNET
 #include <ETH.h>
@@ -54,117 +57,21 @@ AsyncWebServer& getInstance() {
     return server;
 }
 
-// ── Single-pass template engine ───────────────────────────────────────────────
-// Streams directly from a LittleFS File into `out` (pre-reserved String).
-// State machine detects {{...}} placeholders without loading the full template
-// into RAM — peak allocation is just the output String, not template + output.
-static String buildFeatureFlags();  // forward declaration — defined below
 
-static void writeHTMLVar(String& out, const char* var) {
-    char b[12];  // scratch buffer for numeric conversions
-    // ── Shared placeholders ───────────────────────────────────────────────────
-    if      (strcmp(var, "FEATURES")        == 0) { String f = buildFeatureFlags(); out.concat(f); }
-    else if (strcmp(var, "connection_mode") == 0) { out.concat(getConnectionMode()); }
-    else if (strcmp(var, "board_name")      == 0) { out.concat(BOARD_NAME); }
-    else if (strcmp(var, "ID_fixture")      == 0) { out.concat(setConfig.ID_fixture.c_str()); }
-    else if (strcmp(var, "mdns_host")       == 0) { out.concat("rav"); out.concat(setConfig.ID_fixture.c_str()); out.concat(".local"); }
-    else if (strcmp(var, "show_ip_address") == 0) { out.concat(netConfig.currentip.c_str()); }
-    else if (strcmp(var, "wifi_ssid")       == 0) { out.concat(netConfig.wifiSSID.c_str()); }
-    else if (strcmp(var, "wifi_password")   == 0) { out.concat(netConfig.wifiPassword.c_str()); }
-    else if (strcmp(var, "dhcp_checked")    == 0) { if (netConfig.dhcp) out.concat("checked"); }
-    else if (strcmp(var, "ip_address")      == 0) { out.concat(netConfig.ip.c_str()); }
-    else if (strcmp(var, "subnet_mask")     == 0) { out.concat(netConfig.subnet.c_str()); }
-    else if (strcmp(var, "gateway")         == 0) { out.concat(netConfig.gateway.c_str()); }
-    else if (strcmp(var, "DMX_PHYSICAL")    == 0) { if (dmxConfig.dmxInput == DMX_PHYSICAL) out.concat("selected"); }
-    else if (strcmp(var, "ARTNET")          == 0) { if (dmxConfig.dmxInput == ARTNET)        out.concat("selected"); }
-    else if (strcmp(var, "SACN")            == 0) { if (dmxConfig.dmxInput == SACN)          out.concat("selected"); }
-    else if (strcmp(var, "AUTO_SCENE")      == 0) { if (dmxConfig.dmxInput == AUTO_SCENE)    out.concat("selected"); }
-    else if (strcmp(var, "dmx_output")      == 0) { if (dmxConfig.dmxOutputEnabled) out.concat("checked"); }
-    else if (strcmp(var, "start_universe")  == 0) { snprintf(b, sizeof(b), "%u", (unsigned)dmxConfig.startUniverse); out.concat(b); }
-    else if (strcmp(var, "firmware_version")== 0) { out.concat("FW " FW_VERSION); }
-    else if (strncmp(var, "scene_slot_sel_", 15) == 0) {
-        int slot = atoi(var + 15);
-        if (dmxConfig.autoSceneSlot == slot) out.concat("selected");
+// Serve a text asset preferring its pre-gzipped sibling when present. The
+// scripts/gzip_assets.py pre-build hook produces <path>.gz next to each
+// .html/.css/.js asset; here we transparently pick the smaller copy and
+// advertise Content-Encoding: gzip so the browser inflates on the fly.
+static void sendAsset(AsyncWebServerRequest *request,
+                      const char *path, const char *contentType) {
+    String gz = String(path) + ".gz";
+    if (LittleFS.exists(gz)) {
+        AsyncWebServerResponse *r = request->beginResponse(LittleFS, gz, contentType);
+        r->addHeader("Content-Encoding", "gzip");
+        request->send(r);
+    } else {
+        request->send(LittleFS, path, contentType);
     }
-    // ── Fixture-specific ─────────────────────────────────────────────────────
-    else writeFixtureVars(out, var);
-}
-
-static void writeHTMLFromFile(String& out, File& file) {
-    char readBuf[512];  // larger buffer → fewer LittleFS reads
-    char varBuf[64];
-    int  varLen = 0;
-    enum { NORMAL, SAW_OPEN1, IN_VAR, SAW_CLOSE1 } state = NORMAL;
-
-    while (file.available()) {
-        int nr = file.read((uint8_t*)readBuf, sizeof(readBuf));
-        if (nr <= 0) break;
-
-        int batchStart = 0;  // start of unflushed NORMAL run in this buffer
-
-        for (int i = 0; i < nr; i++) {
-            char c = readBuf[i];
-            switch (state) {
-            case NORMAL:
-                if (c == '{') {
-                    // flush the normal run up to (but not including) this '{'
-                    if (i > batchStart) out.concat(readBuf + batchStart, i - batchStart);
-                    state = SAW_OPEN1;
-                }
-                break;
-            case SAW_OPEN1:
-                if (c == '{') { state = IN_VAR; varLen = 0; }
-                else { out += '{'; out += c; state = NORMAL; batchStart = i + 1; }
-                break;
-            case IN_VAR:
-                if (c == '}') state = SAW_CLOSE1;
-                else if (varLen < (int)sizeof(varBuf) - 1) varBuf[varLen++] = c;
-                break;
-            case SAW_CLOSE1:
-                if (c == '}') {
-                    varBuf[varLen] = '\0';
-                    writeHTMLVar(out, varBuf);
-                    state = NORMAL; varLen = 0; batchStart = i + 1;
-                } else {
-                    out.concat("{{"); out.concat(varBuf, varLen); out += '}'; out += c;
-                    state = NORMAL; varLen = 0; batchStart = i + 1;
-                }
-                break;
-            }
-        }
-        // flush remaining NORMAL chars in this buffer
-        if (state == NORMAL && batchStart < nr)
-            out.concat(readBuf + batchStart, nr - batchStart);
-    }
-    if (state == SAW_OPEN1) out += '{';
-    else if (state == IN_VAR)     { out.concat("{{"); out.concat(varBuf, varLen); }
-    else if (state == SAW_CLOSE1) { out.concat("{{"); out.concat(varBuf, varLen); out += '}'; }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Build compile-time feature flags JS object injected into the HTML template
-static String buildFeatureFlags() {
-    String f = "<script>const F={";
-    f += "dmx:1,";
-#ifdef RAVLIGHT_MODULE_DMX_PHYSICAL
-    f += "dmxPhysical:1,";
-#endif
-#ifdef RAVLIGHT_MODULE_RECORDER
-    f += "recorder:1,";
-#endif
-#ifdef RAVLIGHT_MODULE_TEMP
-    f += "temp:1,";
-#endif
-#ifdef RAVLIGHT_MODULE_ETHERNET
-    f += "ethernet:1,";
-#endif
-    f += "fixture:\"" PROJECT_NAME "\",";
-#ifdef RAVLIGHT_MODULE_DISCOVERY
-    f += "discovery:1,";
-#endif
-    f += "};</script>";
-    return f;
 }
 
 void initWebServer() {
@@ -188,50 +95,47 @@ void initWebServer() {
         request->send(LittleFS, "/Iicon.png", "image/png");
     });
     server.on("/style.css", HTTP_GET, [](AsyncWebServerRequest *request) {
-        request->send(LittleFS, "/style.css", "text/css");
+        sendAsset(request, "/style.css", "text/css");
     });
     server.on("/dmxmonitor", HTTP_GET, [](AsyncWebServerRequest *request) {
-        request->send(LittleFS, "/dmxmonitor.html", "text/html");
+        sendAsset(request, "/dmxmonitor.html", "text/html");
     });
 
-    // --- Root page ---
-    // Single-pass template engine → filler callback (no copy).
-    // AsyncBasicResponse copies the full String into a second buffer; on Elyon with 8×200px
-    // outputs the 44 KB result leaves a ~40 KB hole after String realloc, making the copy
-    // fail silently (empty 200 body). The filler callback streams from the heap String
-    // in TCP-chunk pieces — no second allocation. shared_ptr frees it even on disconnect.
+    // --- Root page (SPA shell — static) ---
+    // index.html is now a small (~6 KB) SPA shell that loads app.js + fixture.js
+    // and fetches /api/{features,status,config} for state. No server-side template
+    // engine — page rendering is the client's job, the firmware just streams the
+    // file. Old chunked handler (writeHTMLFromFile state machine) is retained
+    // below for reference but unused; will be removed in the cleanup commit.
     server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-        File file = LittleFS.open("/index.html", "r");
-        if (!file) {
+        if (LittleFS.exists("/index.html") || LittleFS.exists("/index.html.gz")) {
+            sendAsset(request, "/index.html", "text/html");
+        } else {
             request->send(200, "text/html",
                 "<html><body><h2>RavLight FW " FW_VERSION "</h2>"
                 "<p>Web UI not found — upload filesystem via "
                 "<a href='/update'>OTA</a> (select Filesystem).</p>"
                 "</body></html>");
-            return;
         }
-        size_t fileSize = file.size();
-
-        auto pOut = std::shared_ptr<String>(new (std::nothrow) String());
-        if (!pOut) { file.close(); request->send(503, "text/plain", "OOM"); return; }
-        pOut->reserve(fileSize + 30000);
-        writeHTMLFromFile(*pOut, file);
-        file.close();
-
-        if (pOut->length() == 0) {
-            request->send(503, "text/plain", "Render failed — low memory");
-            return;
-        }
-        size_t outLen = pOut->length();
-        Serial.printf("[WS] GET / %u bytes freeHeap=%u\n", outLen, ESP.getFreeHeap());
-        request->send("text/html", outLen,
-            [pOut, outLen](uint8_t* buf, size_t maxLen, size_t idx) -> size_t {
-                if (idx >= outLen) return 0;
-                size_t chunk = (maxLen < outLen - idx) ? maxLen : outLen - idx;
-                memcpy(buf, pOut->c_str() + idx, chunk);
-                return chunk;
-            });
     });
+    server.on("/app.js", HTTP_GET, [](AsyncWebServerRequest *request) {
+        sendAsset(request, "/app.js", "application/javascript");
+    });
+    server.on("/output-card.js", HTTP_GET, [](AsyncWebServerRequest *request) {
+        sendAsset(request, "/output-card.js", "application/javascript");
+    });
+    server.on("/fixture.js", HTTP_GET, [](AsyncWebServerRequest *request) {
+#ifdef RAVLIGHT_FIXTURE_ELYON
+        sendAsset(request, "/elyon/fixture.js", "application/javascript");
+#elif defined(RAVLIGHT_FIXTURE_VEYRON)
+        sendAsset(request, "/veyron/fixture.js", "application/javascript");
+#elif defined(RAVLIGHT_FIXTURE_ORION)
+        sendAsset(request, "/orion/fixture.js", "application/javascript");
+#else
+        request->send(404, "text/plain", "fixture js missing");
+#endif
+    });
+
 
     // --- WiFi scan (shared) ---
     server.on("/scanWiFi", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -359,6 +263,12 @@ void initWebServer() {
     });
 #endif
 
+    // --- DMX activity status (shared by all fixtures + UI header chip) ---
+    server.on("/dmxstatus", HTTP_GET, [](AsyncWebServerRequest *request) {
+        String json = String("{\"active\":") + (dmxIsActive() ? "true" : "false") + "}";
+        request->send(200, "application/json", json);
+    });
+
     // --- DMX Recorder module routes ---
 #ifdef RAVLIGHT_MODULE_RECORDER
     server.on("/startRecording", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -435,6 +345,223 @@ void initWebServer() {
         serializeJsonPretty(doc, output);
         request->send(200, "application/json", output);
     });
+
+    // ─── JSON API for the SPA frontend ──────────────────────────────────────
+    // Same shape as /download_config but smaller (compact, not pretty) and
+    // intended for client-side rendering.
+    server.on("/api/config", HTTP_GET, [](AsyncWebServerRequest *request) {
+        DynamicJsonDocument doc(4096);
+        doc["version"]    = 2;
+        doc["board"]      = BOARD_NAME;
+        doc["project"]    = PROJECT_NAME;
+        doc["ID_fixture"] = setConfig.ID_fixture;
+
+        JsonObject net = doc.createNestedObject("network");
+        net["id"]       = setConfig.ID_fixture;
+        net["ssid"]     = netConfig.wifiSSID;
+        net["password"] = netConfig.wifiPassword;
+        net["dhcp"]     = netConfig.dhcp;
+        net["ip"]       = netConfig.ip;
+        net["subnet"]   = netConfig.subnet;
+        net["gateway"]  = netConfig.gateway;
+
+        JsonObject dmx = doc.createNestedObject("dmx");
+        dmx["input"]    = dmxConfig.dmxInput;
+        dmx["universe"] = dmxConfig.startUniverse;
+#ifdef RAVLIGHT_MODULE_DMX_PHYSICAL
+        dmx["output"]   = dmxConfig.dmxOutputEnabled;
+#endif
+#ifdef RAVLIGHT_MODULE_RECORDER
+        dmx["autoSceneSlot"] = dmxConfig.autoSceneSlot;
+#endif
+
+        JsonObject fix = doc.createNestedObject("fixture");
+        fixtureConfigSerialize(fix);
+
+        String out;
+        serializeJson(doc, out);
+        request->send(200, "application/json", out);
+    });
+
+    // Runtime info — what the SPA shows in the header / status panel.
+    server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+        DynamicJsonDocument doc(512);
+        doc["fw"]            = FW_VERSION;
+        doc["board"]         = BOARD_NAME;
+        doc["project"]       = PROJECT_NAME;
+        doc["id"]            = setConfig.ID_fixture;
+        doc["mode"]          = getConnectionMode();
+        doc["ip"]            = netConfig.currentip;
+        doc["mac"]           = WiFi.macAddress();
+        doc["runtime"]       = currentRuntime;
+        doc["total_runtime"] = totalRuntime;
+        doc["heap_free"]     = ESP.getFreeHeap();
+        doc["heap_min"]      = ESP.getMinFreeHeap();
+#ifdef RAVLIGHT_MODULE_TEMP
+        doc["temp"] = SensTemp;
+#endif
+        doc["dmx_active"] = dmxIsActive();
+        String out;
+        serializeJson(doc, out);
+        request->send(200, "application/json", out);
+    });
+
+    // Compile-time feature flags (formerly emitted inline as <script>const F={...}>).
+    server.on("/api/features", HTTP_GET, [](AsyncWebServerRequest *request) {
+        DynamicJsonDocument doc(256);
+        doc["dmx"] = 1;
+#ifdef RAVLIGHT_MODULE_DMX_PHYSICAL
+        doc["dmxPhysical"] = 1;
+#endif
+#ifdef RAVLIGHT_MODULE_RECORDER
+        doc["recorder"] = 1;
+#endif
+#ifdef RAVLIGHT_MODULE_TEMP
+        doc["temp"] = 1;
+#endif
+#ifdef RAVLIGHT_MODULE_ETHERNET
+        doc["ethernet"] = 1;
+#endif
+#ifdef RAVLIGHT_MODULE_DISCOVERY
+        doc["discovery"] = 1;
+#endif
+#ifdef RAVLIGHT_MODULE_I2S_LED
+        doc["i2s"] = 1;
+#endif
+#ifdef RAVLIGHT_MODULE_EFFECTS
+        doc["effects"] = 1;
+#endif
+        doc["fixture"]    = PROJECT_NAME;
+        doc["hw_outputs"] = HW_LED_OUTPUT_COUNT;
+        JsonArray pins = doc.createNestedArray("hw_pins");
+        for (int i = 0; i < HW_LED_OUTPUT_COUNT; i++) pins.add(HW_LED_OUTPUT_PINS[i]);
+        String out;
+        serializeJson(doc, out);
+        request->send(200, "application/json", out);
+    });
+
+    // GET /stats — runtime perf counters (render fps, mutex wait, heap, ArtNet pps).
+    // POST /stats/reset — zero all accumulators for clean before/after measurement.
+    server.on("/stats", HTTP_GET, [](AsyncWebServerRequest *request) {
+        request->send(200, "application/json", stats_to_json());
+    });
+    server.on("/stats/reset", HTTP_POST, [](AsyncWebServerRequest *request) {
+        stats_reset();
+        request->send(200, "application/json", "{\"ok\":true}");
+    });
+
+    // POST /api/config — apply a JSON config blob and persist to NVS. Validates
+    // before commit; returns {ok, restart_needed} so the client can decide whether
+    // to POST /restart afterwards. Existing form-based /save endpoint remains for
+    // backward compatibility while the SPA is rolled in.
+    // The default DYNAMIC_JSON_DOCUMENT_SIZE (1024) isn't enough for the full
+    // config blob — fixture sections (Elyon/Orion with N LED outputs) can push
+    // raw JSON past 1 KB, and ArduinoJson needs 2-3× that for node storage.
+    AsyncCallbackJsonWebHandler* postConfig = new AsyncCallbackJsonWebHandler(
+        "/api/config",
+        [](AsyncWebServerRequest *request, JsonVariant &body) {
+            if (!body.is<JsonObject>()) {
+                request->send(400, "application/json",
+                              "{\"ok\":false,\"error\":\"invalid json\"}");
+                return;
+            }
+            JsonObject doc = body.as<JsonObject>();
+            bool restartNeeded = false;
+            String restartReason;
+
+            // ── Network section ────────────────────────────────────────────
+            if (doc.containsKey("network")) {
+                JsonObject net = doc["network"].as<JsonObject>();
+                String newSsid    = net["ssid"]     | netConfig.wifiSSID;
+                String newPwd     = net["password"] | netConfig.wifiPassword;
+                bool   newDhcp    = net["dhcp"]     | netConfig.dhcp;
+                String newIp      = net["ip"]       | netConfig.ip;
+                String newSubnet  = net["subnet"]   | netConfig.subnet;
+                String newGateway = net["gateway"]  | netConfig.gateway;
+                if (newSsid != netConfig.wifiSSID ||
+                    newPwd  != netConfig.wifiPassword ||
+                    newDhcp != netConfig.dhcp ||
+                    newIp   != netConfig.ip ||
+                    newSubnet  != netConfig.subnet ||
+                    newGateway != netConfig.gateway) {
+                    netConfig.wifiSSID     = newSsid;
+                    netConfig.wifiPassword = newPwd;
+                    netConfig.dhcp         = newDhcp;
+                    netConfig.ip           = newIp;
+                    netConfig.subnet       = newSubnet;
+                    netConfig.gateway      = newGateway;
+                    restartNeeded = true;
+                    if (restartReason.length() == 0) restartReason = "network";
+                }
+            }
+
+            // ── ID_fixture (mDNS hostname / AP SSID) ───────────────────────
+            if (doc.containsKey("ID_fixture")) {
+                String newId = doc["ID_fixture"] | setConfig.ID_fixture;
+                if (newId != setConfig.ID_fixture && newId.length() > 0) {
+                    setConfig.ID_fixture = newId;
+                    restartNeeded = true;
+                    if (restartReason.length() == 0) restartReason = "ID_fixture";
+                }
+            }
+
+            // ── DMX section ────────────────────────────────────────────────
+            if (doc.containsKey("dmx")) {
+                JsonObject dmx = doc["dmx"].as<JsonObject>();
+                uint8_t  newInput = dmx["input"]    | (uint8_t)dmxConfig.dmxInput;
+                uint16_t newUniv  = dmx["universe"] | dmxConfig.startUniverse;
+                if (newInput != dmxConfig.dmxInput || newUniv != dmxConfig.startUniverse) {
+                    dmxConfig.dmxInput     = newInput;
+                    dmxConfig.startUniverse = newUniv;
+                    restartNeeded = true;
+                    if (restartReason.length() == 0) restartReason = "dmx";
+                }
+#ifdef RAVLIGHT_MODULE_DMX_PHYSICAL
+                bool newOut = dmx["output"] | dmxConfig.dmxOutputEnabled;
+                if (newOut != dmxConfig.dmxOutputEnabled) {
+                    dmxConfig.dmxOutputEnabled = newOut;
+                    restartNeeded = true;
+                    if (restartReason.length() == 0) restartReason = "dmx_output";
+                }
+#endif
+#ifdef RAVLIGHT_MODULE_RECORDER
+                uint8_t newSlot = dmx["autoSceneSlot"] | dmxConfig.autoSceneSlot;
+                if (newSlot != dmxConfig.autoSceneSlot) {
+                    dmxConfig.autoSceneSlot = newSlot;
+                }
+#endif
+            }
+
+            // ── Fixture section ────────────────────────────────────────────
+            // Delegated to fixtureConfigDeserialize() which already understands
+            // the on-disk JSON shape (outputs[]). Validation responsibility
+            // currently sits in handleFixtureSaveParams's form path — for the SPA
+            // path we trust the client and rely on saveConfig() not crashing on
+            // bad values. A dedicated fixtureValidateJson() is a TODO.
+            if (doc.containsKey("fixture")) {
+                JsonObject fix = doc["fixture"].as<JsonObject>();
+                fixtureConfigDeserialize(fix);
+                // Let the fixture push live updates to its runtime; the return
+                // value says whether changes still need a restart (e.g. LED
+                // count/protocol changes that require RMT re-init).
+                if (fixtureApplyLive()) {
+                    restartNeeded = true;
+                    if (restartReason.length() == 0) restartReason = "fixture";
+                }
+            }
+
+            saveConfig();
+
+            DynamicJsonDocument resp(192);
+            resp["ok"]             = true;
+            resp["restart_needed"] = restartNeeded;
+            if (restartReason.length() > 0) resp["restart_reason"] = restartReason;
+            String out;
+            serializeJson(resp, out);
+            request->send(200, "application/json", out);
+        },
+        4096);  // maxJsonBufferSize — full config blob can exceed 1 KB
+    server.addHandler(postConfig);
 
     registerFixtureRoutes(server);
 
@@ -605,4 +732,3 @@ void scheduleRestart() {
 
 
 
-    

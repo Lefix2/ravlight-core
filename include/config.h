@@ -13,6 +13,8 @@
   #include "fixtures/veyron/fixture.h"
 #elif defined(RAVLIGHT_FIXTURE_ELYON)
   #include "fixtures/elyon/fixture.h"
+#elif defined(RAVLIGHT_FIXTURE_ORION)
+  #include "fixtures/orion/fixture.h"
 #else
   #define PROJECT_NAME    "RavLight"
   #define FIXTURE_STATUS  "unknown"
@@ -32,7 +34,8 @@ enum DmxInputType {
     DMX_PHYSICAL = 1,
     ARTNET,
     SACN,
-    AUTO_SCENE
+    AUTO_SCENE,
+    EFFECTS        // built-in effects engine (RAVLIGHT_MODULE_EFFECTS)
 };
 
 // DMX transport config — fixture-specific parameters live in each fixture's own config struct.
@@ -66,6 +69,7 @@ void loadConfig();
 void saveConfig();
 void resetConfig();
 void applyConfigJson(DynamicJsonDocument& doc);
+void buildConfigJson(DynamicJsonDocument& doc);  // serialize current state → doc
 
 #ifdef RAVLIGHT_MODULE_RESET
 void checkResetButton();
